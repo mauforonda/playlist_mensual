@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 
+from typing import Dict, List
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import json
+import os
 from datetime import datetime as dt
 from time import sleep
 
@@ -12,43 +14,49 @@ LAST_RUN = "last"
 # TODO: Make this more reliable, test for network failures
 # and cases where unexpected changes happen outside.
 
-
-def login():
+def login() -> spotipy.Spotify:
     # Authenticate on Spotify.
 
     # TODO: Confirm that I need all these permissions
     scope = "user-library-read playlist-modify-public playlist-modify-private"
 
     # TODO: Find a more reliable way to handle credentials
-    with open(CREDENTIALS, "r+") as f:
+    with open(CREDENTIALS) as f:
         credentials = json.load(f)
+        client_id = credentials["client_id"]
+        client_secret = credentials["client_secret"]
+        redirect_uri = credentials["redirect_uri"]
 
-    # The first time a user runs the script,
-    # he'll have to copy a url from his browser
-    # TODO: How to improve first-time authentication?
     return spotipy.Spotify(
         auth_manager=SpotifyOAuth(
-            client_id=credentials["client_id"],
-            client_secret=credentials["client_secret"],
-            redirect_uri="https://example.org",
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
             scope=scope,
         )
     )
 
 
-def get_pending(sp):
+def get_pending(sp: spotipy.Spotify) -> Dict[str, List[str]]:
     # List all liked songs since the last run grouped by month
+    # On the first run, archive all songs from the current month
 
     pending = {}
     offset = 0
+    flag = False
 
     # TODO: Is there a better way to handle state?
-    # TODO: What happens when there's no LAST_RUN file?
-    with open(LAST_RUN, "r+") as f:
-        last = int(f.read().strip())
+    if os.path.exists(LAST_RUN):
+        with open(LAST_RUN) as f:
+            last = int(f.read().strip())
+    else:
+        last = (
+            dt.utcnow()
+            .replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            .timestamp()
+        )
 
-    # TODO: A nested loop looks ugly, is there a better way?
-    while True:
+    while not flag:
         songs = sp.current_user_saved_tracks(limit=50, offset=offset)
 
         for song in songs["items"]:
@@ -56,22 +64,16 @@ def get_pending(sp):
             if timestamp.timestamp() <= last:
                 flag = True
                 break
-            else:
-                month = timestamp.strftime("%B %Y")
-                song_id = song["track"]["id"]
-                if month in pending.keys():
-                    pending[month].append(song_id)
-                else:
-                    pending[month] = [song_id]
-        if flag:
-            break
+            month = timestamp.strftime("%B %Y")
+            song_id = song["track"]["id"]
+            pending.setdefault(month, []).append(song_id)
 
         offset += 50
 
     return pending
 
 
-def get_user_playlists(sp, user):
+def get_user_playlists(sp: spotipy.Spotify, user: str) -> Dict[str, str]:
     # Get all public playlists created by the user
 
     # TODO: Add an option for private playlists
@@ -81,7 +83,7 @@ def get_user_playlists(sp, user):
     user_playlists = {
         p["name"]: p["id"]
         for p in playlists["items"]
-        if p["owner"]["id"] == user and p["public"]
+        if p["owner"]["id"] == user
     }
     return user_playlists
 
@@ -89,37 +91,43 @@ def get_user_playlists(sp, user):
 def archive_likes():
     # Archive all likes since the last run in monthly playlists
 
-    # TODO: Passing around `sp` looks ugly, is there a better way?
     sp = login()
     user = sp.current_user()["id"]
     pending = get_pending(sp)
     user_playlists = get_user_playlists(sp, user)
 
-    for month in pending.keys():
+    for month, songs in pending.items():
         # TODO: Can I make sure playlists get updated in the right order
         # so that sorting by modification date in the UI makes sense?
-        pending_month = list(reversed(pending[month]))
+        songs = list(reversed(songs))
+
         # Chunks of 50 because that's the maximum number of songs you
         # can add to a playlist at once.
         # TODO: Am I sure of this limit? Maybe parametrize this
         # to change it fast if the API changes?
-        pending_month = [
-            pending_month[i : i + 50] for i in range(0, len(pending_month), 50)
-        ]
-
         # TODO: Are you sure there's no better way to get the new playlist ID?
-        if month not in user_playlists.keys():
-            print(f"New playlist: {month}")
-            sp.user_playlist_create(user, month, public=True)
-            sleep(3)
-            user_playlists = get_user_playlists(sp, user)
 
-        for songs in pending_month:
-            print(f"{len(songs)} songs added to {month}")
-            sp.user_playlist_add_tracks(user, user_playlists[month], songs)
+        if month not in user_playlists:
+            try:
+                sp.user_playlist_create(user, month, public=True)
+                print(f"New playlist: {month}")
+                sleep(3)
+                user_playlists = get_user_playlists(sp, user)
+            except spotipy.SpotifyException:
+                continue
+
+        playlist_id = user_playlists[month]
+        for i in range(0, len(songs), 50):
+            chunk = songs[i : i + 50]
+            try:
+                sp.user_playlist_add_tracks(user, playlist_id, chunk)
+            except spotipy.SpotifyException:
+                continue
+        print(f"{len(songs)} songs added to {month}")
 
     with open(LAST_RUN, "w+") as f:
         f.write(str(int(dt.now().timestamp())))
+
 
 if __name__ == "__main__":
     archive_likes()
